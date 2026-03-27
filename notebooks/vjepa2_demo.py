@@ -6,6 +6,7 @@
 import json
 import os
 import subprocess
+import time
 
 import numpy as np
 import torch
@@ -67,6 +68,7 @@ def forward_vjepa_video(model_hf, model_pt, hf_transform, pt_transform):
     # Run a sample inference with VJEPA
     with torch.inference_mode():
         # Read and pre-process the image
+        start_get_video = time.time()
         video = get_video()  # T x H x W x C
         video = torch.from_numpy(video).permute(0, 3, 1, 2)  # T x C x H x W
         x_pt = pt_transform(video).cuda().unsqueeze(0)
@@ -102,7 +104,7 @@ def run_sample_inference():
         "facebook/vjepa2-vitg-fpc64-384"  # Replace with your favored model, e.g. facebook/vjepa2-vitg-fpc64-384
     )
     # Path to local PyTorch weights
-    pt_model_path = "YOUR_MODEL_PATH"
+    pt_model_path = "checkpoints/vitg-384.pt"
 
     sample_video_path = "sample_video.mp4"
     # Download the video if not yet downloaded to local path
@@ -144,7 +146,7 @@ def run_sample_inference():
     )
 
     # Initialize the classifier
-    classifier_model_path = "YOUR_ATTENTIVE_PROBE_PATH"
+    classifier_model_path = "checkpoints/ssv2-vitg-384-64x2x3.pt"
     classifier = (
         AttentiveClassifier(embed_dim=model_pt.embed_dim, num_heads=16, depth=4, num_classes=174).cuda().eval()
     )
