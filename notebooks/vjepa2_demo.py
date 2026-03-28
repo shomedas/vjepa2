@@ -22,6 +22,17 @@ from src.models.vision_transformer import vit_giant_xformers_rope
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
+# HuggingFace model repo name
+hf_model_name = (
+    "facebook/vjepa2-vitg-fpc64-384"  # Replace with your favored model, e.g. facebook/vjepa2-vitg-fpc64-384
+    )
+
+# Path to local PyTorch weights
+pt_model_path = "checkpoints/vitg-384.pt"
+
+classifier_model_path = "checkpoints/ssv2-vitg-384-64x2x3.pt"
+
+ssv2_classes_path = "ssv2_classes.json"
 
 def load_pretrained_vjepa_pt_weights(model, pretrained_weights):
     # Load weights of the VJEPA2 encoder
@@ -68,7 +79,6 @@ def forward_vjepa_video(model_hf, model_pt, hf_transform, pt_transform):
     # Run a sample inference with VJEPA
     with torch.inference_mode():
         # Read and pre-process the image
-        start_get_video = time.time()
         video = get_video()  # T x H x W x C
         video = torch.from_numpy(video).permute(0, 3, 1, 2)  # T x C x H x W
         x_pt = pt_transform(video).cuda().unsqueeze(0)
@@ -99,20 +109,6 @@ def get_vjepa_video_classification_results(classifier, out_patch_features_pt):
 
 
 def run_sample_inference():
-    # HuggingFace model repo name
-    hf_model_name = (
-        "facebook/vjepa2-vitg-fpc64-384"  # Replace with your favored model, e.g. facebook/vjepa2-vitg-fpc64-384
-    )
-    # Path to local PyTorch weights
-    pt_model_path = "checkpoints/vitg-384.pt"
-
-    sample_video_path = "sample_video.mp4"
-    # Download the video if not yet downloaded to local path
-    if not os.path.exists(sample_video_path):
-        video_url = "https://huggingface.co/datasets/nateraw/kinetics-mini/resolve/main/val/bowling/-WH-lxmGJVY_000005_000015.mp4"
-        command = ["wget", video_url, "-O", sample_video_path]
-        subprocess.run(command)
-        print("Downloading video")
 
     # Initialize the HuggingFace model, load pretrained weights
     model_hf = AutoModel.from_pretrained(hf_model_name)
@@ -134,7 +130,7 @@ def run_sample_inference():
     out_patch_features_hf, out_patch_features_pt = forward_vjepa_video(
         model_hf, model_pt, hf_transform, pt_video_transform
     )
-
+    
     print(
         f"""
         Inference results on video:
@@ -146,24 +142,10 @@ def run_sample_inference():
     )
 
     # Initialize the classifier
-    classifier_model_path = "checkpoints/ssv2-vitg-384-64x2x3.pt"
     classifier = (
         AttentiveClassifier(embed_dim=model_pt.embed_dim, num_heads=16, depth=4, num_classes=174).cuda().eval()
     )
     load_pretrained_vjepa_classifier_weights(classifier, classifier_model_path)
-
-    # Download SSV2 classes if not already present
-    ssv2_classes_path = "ssv2_classes.json"
-    if not os.path.exists(ssv2_classes_path):
-        command = [
-            "wget",
-            "https://huggingface.co/datasets/huggingface/label-files/resolve/d79675f2d50a7b1ecf98923d42c30526a51818e2/"
-            "something-something-v2-id2label.json",
-            "-O",
-            "ssv2_classes.json",
-        ]
-        subprocess.run(command)
-        print("Downloading SSV2 classes")
 
     get_vjepa_video_classification_results(classifier, out_patch_features_pt)
 
