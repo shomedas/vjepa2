@@ -32,3 +32,4 @@ app/vjepa_droid_v4/local/
 configs/localcheckpoints/
 latest_motion.npy
 *.mp4
+checkpoints/
