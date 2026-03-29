@@ -21,22 +21,20 @@ from src.models.vision_transformer import vit_giant_xformers_rope
 
 import cv2
 
-# ---------------- CAMERA and ACTION CAPTURE PARAMETERS ----------------
+# ---------------- CAMERA CONFIG AND OPTICAL FLOW BASED MOTION DETECTION PARAMETERS ----------------
 CAM_ID = 0
-FPS = 60
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
+FPS = 60
 
-# Motion detection
-MOTION_THRESHOLD = 25
-MOTION_AREA_RATIO = 0.001
+# Motion detection thresholds
+START_THRESHOLD = 1.2     # start motion
+STOP_THRESHOLD = 0.5      # stop motion
 
-# Temporal logic
-MIN_MOTION_FRAMES = 5
-NO_MOTION_FRAMES_TO_END = 20
-MIN_NO_MOTION_BEFORE_START = 15   # IMPORTANT (prevents merging)
+MIN_MOTION_FRAMES = 5     # avoid noise
+NO_MOTION_FRAMES = 10     # confirm motion end
 
-OUTPUT_FILE = "latest_motion.npy"
+SAVE_PATH = "motion.npy"
 
 # ----------------------------------------------
 
@@ -58,15 +56,16 @@ ssv2_classes_path = "ssv2_classes.json"
 
 # -------------------------------------------
 
-def detect_motion(prev_gray, curr_gray):
-    diff = cv2.absdiff(prev_gray, curr_gray)
-    _, thresh = cv2.threshold(diff, MOTION_THRESHOLD, 255, cv2.THRESH_BINARY)
+def compute_flow_magnitude(prev_gray, gray):
+    flow = cv2.calcOpticalFlowFarneback(
+        prev_gray, gray, None,
+        0.5, 3, 15, 3, 5, 1.2, 0
+    )
+    mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    return np.mean(mag)
 
-    motion_ratio = np.sum(thresh > 0) / thresh.size
-    return motion_ratio > MOTION_AREA_RATIO
 
-
-def play_video(frames, fps=20):
+def replay_video(frames, fps=30):
     delay = int(1000 / fps)
     for f in frames:
         cv2.imshow("Captured Motion", f)
@@ -201,6 +200,7 @@ def main():
     # Build PyTorch preprocessing transform
     pt_video_transform = build_pt_video_transform(img_size=img_size)
 
+
     # ----------------------------------------------   
 
     cap = cv2.VideoCapture(CAM_ID)
@@ -212,96 +212,82 @@ def main():
 
     # State variables
     in_motion = False
-    ready_for_motion = False
-
     motion_buffer = []
 
     motion_count = 0
     no_motion_count = 0
-    no_motion_gap = 0
 
-    print(" Webcam started. Press 'q' to quit.")
+    print("Press 'q' to quit")
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+        frame = cv2.flip(frame, 1)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         if prev_gray is None:
             prev_gray = gray
             continue
 
-        motion = detect_motion(prev_gray, gray)
-
-        # ----------------------------------------
-        # TRACK NO-MOTION GAP (for clean separation)
-        # ----------------------------------------
-        if not motion:
-            no_motion_gap += 1
-            no_motion_count += 1
-        else:
-            no_motion_gap = 0
-            no_motion_count = 0
-
-        # ----------------------------------------
-        # ARM SYSTEM (only after sufficient no-motion)
-        # ----------------------------------------
-        if not in_motion and no_motion_gap >= MIN_NO_MOTION_BEFORE_START:
-            ready_for_motion = True
-
-        # ----------------------------------------
-        # START MOTION (clean start, no old frames)
-        # ----------------------------------------
-        if motion and not in_motion and ready_for_motion:
-            motion_count += 1
-
-            if motion_count >= MIN_MOTION_FRAMES:
-                print("Motion START (clean)")
-                in_motion = True
-                motion_buffer = []   # IMPORTANT: no previous frames
-                ready_for_motion = False
-                motion_count = 0
-
-        # ----------------------------------------
-        # RECORD FRAMES
-        # ----------------------------------------
-        if in_motion:
-            motion_buffer.append(frame)
-
-        # ----------------------------------------
-        # END MOTION
-        # ----------------------------------------
-        if in_motion and no_motion_count >= NO_MOTION_FRAMES_TO_END:
-            print("Motion END")
-
-            if len(motion_buffer) > 0:
-                clip = np.array(motion_buffer, dtype=np.uint8)
-                print(f"Saved clip shape: {clip.shape}")
-
-                np.save(OUTPUT_FILE, clip)
-
-                cv2.waitKey(1000)  # Pause before playback
-
-                # Playback
-                play_video(clip, FPS)
-                run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, clip)
-
-            # RESET STATE
-            in_motion = False
-            motion_buffer = []
-            motion_count = 0
-            no_motion_count = 0
-            no_motion_gap = 0
-
+        motion_score = compute_flow_magnitude(prev_gray, gray)
         prev_gray = gray
 
-        # ----------------------------------------
-        # LIVE VIEW
-        # ----------------------------------------
-        cv2.imshow("Live Feed", frame)
+        # -------- Motion Logic --------
+        if not in_motion:
+            if motion_score > START_THRESHOLD:
+                motion_count += 1
+                if motion_count >= MIN_MOTION_FRAMES:
+                    print(">>> Motion START")
+                    in_motion = True
+                    motion_buffer = []  # clear old buffer
+                    no_motion_count = 0
+            else:
+                motion_count = 0
+
+        else:
+            motion_buffer.append(frame)
+
+            if motion_score < STOP_THRESHOLD:
+                no_motion_count += 1
+                if no_motion_count >= NO_MOTION_FRAMES:
+                    print(">>> Motion END")
+
+                    if len(motion_buffer) > 0:
+                        video_np = np.array(motion_buffer, dtype=np.uint8)
+
+                        # Save (overwrite previous)
+                        np.save(SAVE_PATH, video_np)
+                        print(f"Saved motion: {video_np.shape}")
+
+                        # Replay captured motion
+                        replay_video(video_np, fps=FPS)
+
+                        # run VJEPA inference on the captured motion
+                        run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, video_np)
+
+                    # Reset state
+                    in_motion = False
+                    motion_buffer = []
+                    motion_count = 0
+                    no_motion_count = 0
+            else:
+                no_motion_count = 0
+
+        # -------- Debug Display --------
+        display = frame.copy()
+        cv2.putText(display, f"Motion: {motion_score:.2f}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    1, (0, 255, 0), 2)
+
+        state_text = "MOVING" if in_motion else "IDLE"
+        cv2.putText(display, state_text,
+                    (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
+                    1, (0, 0, 255) if in_motion else (255, 0, 0), 2)
+
+        cv2.imshow("Live", display)
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
