@@ -21,16 +21,20 @@ from src.models.vision_transformer import vit_giant_xformers_rope
 
 import cv2
 
-# ---------------- PARAMETERS ----------------
+# ---------------- CAMERA and ACTION CAPTURE PARAMETERS ----------------
 CAM_ID = 0
+FPS = 60
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
-FPS = 20
 
-MOTION_THRESHOLD = 25        # pixel difference threshold
-MOTION_AREA_RATIO = 0.01    # % pixels that must change
-MIN_MOTION_FRAMES = 5       # avoid noise
-NO_MOTION_FRAMES_TO_END = 15
+# Motion detection
+MOTION_THRESHOLD = 25
+MOTION_AREA_RATIO = 0.001
+
+# Temporal logic
+MIN_MOTION_FRAMES = 5
+NO_MOTION_FRAMES_TO_END = 20
+MIN_NO_MOTION_BEFORE_START = 15   # IMPORTANT (prevents merging)
 
 OUTPUT_FILE = "latest_motion.npy"
 
@@ -88,7 +92,7 @@ def load_pretrained_vjepa_classifier_weights(model, pretrained_weights):
     pretrained_dict = torch.load(pretrained_weights, weights_only=True, map_location="cpu")["classifiers"][0]
     pretrained_dict = {k.replace("module.", ""): v for k, v in pretrained_dict.items()}
     msg = model.load_state_dict(pretrained_dict, strict=False)
-    print("Pretrained weights found at {} and loaded with msg: {}".format(pretrained_weights, msg))
+    #print("Pretrained weights found at {} and loaded with msg: {}".format(pretrained_weights, msg))
 
 
 def build_pt_video_transform(img_size):
@@ -139,7 +143,7 @@ def get_vjepa_video_classification_results(classifier, out_patch_features_pt):
     with torch.inference_mode():
         out_classifier = classifier(out_patch_features_pt)
 
-    print(f"Classifier output shape: {out_classifier.shape}")
+    #print(f"Classifier output shape: {out_classifier.shape}")
 
     print("Top 5 predicted class names:")
     top5_indices = out_classifier.topk(5).indices[0]
@@ -147,7 +151,7 @@ def get_vjepa_video_classification_results(classifier, out_patch_features_pt):
     for idx, prob in zip(top5_indices, top5_probs):
         str_idx = str(idx.item())
         print(f"{SOMETHING_SOMETHING_V2_CLASSES[str_idx]} ({prob}%)")
-
+    print("------------------------------------------------------------------------------")
     return
 
 
@@ -158,15 +162,15 @@ def run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, c
         model_hf, model_pt, hf_transform, pt_video_transform, clip
     )
     
-    print(
-        f"""
-        Inference results on video:
-        HuggingFace output shape: {out_patch_features_hf.shape}
-        PyTorch output shape:     {out_patch_features_pt.shape}
-        Absolute difference sum:  {torch.abs(out_patch_features_pt - out_patch_features_hf).sum():.6f}
-        Close: {torch.allclose(out_patch_features_pt, out_patch_features_hf, atol=1e-3, rtol=1e-3)}
-        """
-    )
+    # print(
+    #     f"""
+    #     Inference results on video:
+    #     HuggingFace output shape: {out_patch_features_hf.shape}
+    #     PyTorch output shape:     {out_patch_features_pt.shape}
+    #     Absolute difference sum:  {torch.abs(out_patch_features_pt - out_patch_features_hf).sum():.6f}
+    #     Close: {torch.allclose(out_patch_features_pt, out_patch_features_hf, atol=1e-3, rtol=1e-3)}
+    #     """
+    # )
 
     # Initialize the classifier
     classifier = (
@@ -177,10 +181,7 @@ def run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, c
     get_vjepa_video_classification_results(classifier, out_patch_features_pt)
 
 def main():
-    cap = cv2.VideoCapture(CAM_ID)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, FPS)
+
 
     # --------------------------------------------------
 
@@ -202,16 +203,24 @@ def main():
 
     # ----------------------------------------------   
 
+    cap = cv2.VideoCapture(CAM_ID)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, FPS)
+
     prev_gray = None
 
-    buffer = []
+    # State variables
+    in_motion = False
+    ready_for_motion = False
+
     motion_buffer = []
 
-    in_motion = False
     motion_count = 0
     no_motion_count = 0
+    no_motion_gap = 0
 
-    print("Starting capture... Press 'q' to quit")
+    print(" Webcam started. Press 'q' to quit.")
 
     while True:
         ret, frame = cap.read()
@@ -227,50 +236,71 @@ def main():
 
         motion = detect_motion(prev_gray, gray)
 
-        # Always maintain buffer
-        buffer.append(frame)
-        if len(buffer) > FPS * 5:  # keep last 5 seconds
-            buffer.pop(0)
-
-        if motion:
-            motion_count += 1
-            no_motion_count = 0
-        else:
+        # ----------------------------------------
+        # TRACK NO-MOTION GAP (for clean separation)
+        # ----------------------------------------
+        if not motion:
+            no_motion_gap += 1
             no_motion_count += 1
+        else:
+            no_motion_gap = 0
+            no_motion_count = 0
 
-        # START MOTION
-        if not in_motion and motion_count >= MIN_MOTION_FRAMES:
-            print("Motion started")
-            in_motion = True
-            motion_buffer = buffer.copy()  # include context
+        # ----------------------------------------
+        # ARM SYSTEM (only after sufficient no-motion)
+        # ----------------------------------------
+        if not in_motion and no_motion_gap >= MIN_NO_MOTION_BEFORE_START:
+            ready_for_motion = True
 
-        # DURING MOTION
+        # ----------------------------------------
+        # START MOTION (clean start, no old frames)
+        # ----------------------------------------
+        if motion and not in_motion and ready_for_motion:
+            motion_count += 1
+
+            if motion_count >= MIN_MOTION_FRAMES:
+                print("Motion START (clean)")
+                in_motion = True
+                motion_buffer = []   # IMPORTANT: no previous frames
+                ready_for_motion = False
+                motion_count = 0
+
+        # ----------------------------------------
+        # RECORD FRAMES
+        # ----------------------------------------
         if in_motion:
             motion_buffer.append(frame)
 
+        # ----------------------------------------
         # END MOTION
+        # ----------------------------------------
         if in_motion and no_motion_count >= NO_MOTION_FRAMES_TO_END:
-            print("Motion ended")
+            print("Motion END")
 
-            clip = np.array(motion_buffer, dtype=np.uint8)
+            if len(motion_buffer) > 0:
+                clip = np.array(motion_buffer, dtype=np.uint8)
+                print(f"Saved clip shape: {clip.shape}")
 
-#            print(f"Saving clip: shape={clip.shape}")
-#            np.save(OUTPUT_FILE, clip)
+                np.save(OUTPUT_FILE, clip)
 
-            # Play captured clip
-            play_video(clip, FPS)
+                cv2.waitKey(1000)  # Pause before playback
 
-            run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, clip)
+                # Playback
+                play_video(clip, FPS)
+                run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, clip)
 
-            # Reset
+            # RESET STATE
             in_motion = False
             motion_buffer = []
             motion_count = 0
             no_motion_count = 0
+            no_motion_gap = 0
 
         prev_gray = gray
 
-        # Live preview
+        # ----------------------------------------
+        # LIVE VIEW
+        # ----------------------------------------
         cv2.imshow("Live Feed", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
