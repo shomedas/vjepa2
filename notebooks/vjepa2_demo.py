@@ -19,6 +19,8 @@ import src.datasets.utils.video.volume_transforms as volume_transforms
 from src.models.attentive_pooler import AttentiveClassifier
 from src.models.vision_transformer import vit_giant_xformers_rope
 
+
+
 import cv2
 
 # ---------------- CAMERA CONFIG AND OPTICAL FLOW BASED MOTION DETECTION PARAMETERS ----------------
@@ -28,10 +30,10 @@ FRAME_HEIGHT = 480
 FPS = 60
 
 # Motion detection thresholds
-START_THRESHOLD = 1.2     # start motion
-STOP_THRESHOLD = 0.5      # stop motion
+START_THRESHOLD = 0.3     # start motion
+STOP_THRESHOLD = 0.2      # stop motion
 
-MIN_MOTION_FRAMES = 5     # avoid noise
+MIN_MOTION_FRAMES = 10     # avoid noise
 NO_MOTION_FRAMES = 10     # confirm motion end
 
 SAVE_PATH = "motion.npy"
@@ -47,7 +49,7 @@ hf_model_name = (
     )
 
 # Path to local PyTorch weights
-pt_model_path = "checkpoints/vitg-384.pt"
+pt_model_path = "checkpoints/vitg-384.pt" # vjepa2_1_vitb_dist_vitG_384.pt" 
 
 classifier_model_path = "checkpoints/ssv2-vitg-384-64x2x3.pt"
 
@@ -64,7 +66,7 @@ def compute_flow_magnitude(prev_gray, gray):
     mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
     return np.mean(mag)
 
-
+"""
 def replay_video(frames, fps=30):
     delay = int(1000 / fps)
     for f in frames:
@@ -72,7 +74,7 @@ def replay_video(frames, fps=30):
         if cv2.waitKey(delay) & 0xFF == 27:
             break
     cv2.destroyWindow("Captured Motion")
-
+"""
 # --------------------------------------------
 
 def load_pretrained_vjepa_pt_weights(model, pretrained_weights):
@@ -125,42 +127,47 @@ def forward_vjepa_video(model_hf, model_pt, hf_transform, pt_transform, clip):
     with torch.inference_mode():
         # Read and pre-process the image
         #video = get_video()  # T x H x W x C
-        video = sample_frames(clip, num_samples=64) 
+        video = sample_frames(clip, num_samples=8) 
         video = torch.from_numpy(video).permute(0, 3, 1, 2)  # T x C x H x W
-        x_pt = pt_transform(video).cuda().unsqueeze(0)
+        #x_pt = pt_transform(video).cuda().unsqueeze(0)
         x_hf = hf_transform(video, return_tensors="pt")["pixel_values_videos"].to("cuda")
         # Extract the patch-wise features from the last layer
-        out_patch_features_pt = model_pt(x_pt)
+        #out_patch_features_pt = model_pt(x_pt)
         out_patch_features_hf = model_hf.get_vision_features(x_hf)
 
-    return out_patch_features_hf, out_patch_features_pt
+    #return out_patch_features_hf, out_patch_features_pt
+    return out_patch_features_hf
 
 
-def get_vjepa_video_classification_results(classifier, out_patch_features_pt):
+def get_vjepa_video_classification_results(classifier, out_patch_features):
     SOMETHING_SOMETHING_V2_CLASSES = json.load(open("ssv2_classes.json", "r"))
 
     with torch.inference_mode():
-        out_classifier = classifier(out_patch_features_pt)
+        out_classifier = classifier(out_patch_features)
 
     #print(f"Classifier output shape: {out_classifier.shape}")
 
-    print("Top 5 predicted class names:")
-    top5_indices = out_classifier.topk(5).indices[0]
-    top5_probs = F.softmax(out_classifier.topk(5).values[0]) * 100.0  # convert to percentage
-    for idx, prob in zip(top5_indices, top5_probs):
+    print("Top 3 predicted class names:")
+    top3_indices = out_classifier.topk(3).indices[0]
+    top3_probs = F.softmax(out_classifier.topk(3).values[0]) * 100.0  # convert to percentage
+    for idx, prob in zip(top3_indices, top3_probs):
         str_idx = str(idx.item())
         print(f"{SOMETHING_SOMETHING_V2_CLASSES[str_idx]} ({prob}%)")
     print("------------------------------------------------------------------------------")
     return
 
 
-def run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, clip):
+def run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, classifier, clip):
 
     # Inference on video
-    out_patch_features_hf, out_patch_features_pt = forward_vjepa_video(
+    #out_patch_features_hf, out_patch_features_pt = forward_vjepa_video(
+    #    model_hf, model_pt, hf_transform, pt_video_transform, clip
+    #)
+    
+    out_patch_features = forward_vjepa_video(
         model_hf, model_pt, hf_transform, pt_video_transform, clip
     )
-    
+
     # print(
     #     f"""
     #     Inference results on video:
@@ -171,13 +178,8 @@ def run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, c
     #     """
     # )
 
-    # Initialize the classifier
-    classifier = (
-        AttentiveClassifier(embed_dim=model_pt.embed_dim, num_heads=16, depth=4, num_classes=174).cuda().eval()
-    )
-    load_pretrained_vjepa_classifier_weights(classifier, classifier_model_path)
+    get_vjepa_video_classification_results(classifier, out_patch_features)
 
-    get_vjepa_video_classification_results(classifier, out_patch_features_pt)
 
 def main():
 
@@ -197,9 +199,17 @@ def main():
     model_pt.cuda().eval()
     load_pretrained_vjepa_pt_weights(model_pt, pt_model_path)
 
+    # for speed, we can compile the PyTorch model
+    #model_pt = torch.compile(model_pt, mode="max-autotune")
+
     # Build PyTorch preprocessing transform
     pt_video_transform = build_pt_video_transform(img_size=img_size)
 
+    # Initialize the classifier
+    classifier = (
+        AttentiveClassifier(embed_dim=model_pt.embed_dim, num_heads=16, depth=4, num_classes=174).cuda().eval()
+    )
+    load_pretrained_vjepa_classifier_weights(classifier, classifier_model_path)
 
     # ----------------------------------------------   
 
@@ -262,10 +272,15 @@ def main():
                         print(f"Saved motion: {video_np.shape}")
 
                         # Replay captured motion
-                        replay_video(video_np, fps=FPS)
+                        #replay_video(video_np, fps=FPS)
 
+                        start_time = time.perf_counter()
                         # run VJEPA inference on the captured motion
-                        run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, video_np)
+                        run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, classifier, video_np)
+
+                        end_time = time.perf_counter()
+                        elapsed_time = end_time - start_time
+                        print(f"Inferencing took {elapsed_time:.4f} seconds")
 
                     # Reset state
                     in_motion = False
