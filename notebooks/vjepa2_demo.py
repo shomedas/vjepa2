@@ -19,6 +19,23 @@ import src.datasets.utils.video.volume_transforms as volume_transforms
 from src.models.attentive_pooler import AttentiveClassifier
 from src.models.vision_transformer import vit_giant_xformers_rope
 
+import cv2
+
+# ---------------- PARAMETERS ----------------
+CAM_ID = 0
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+FPS = 20
+
+MOTION_THRESHOLD = 25        # pixel difference threshold
+MOTION_AREA_RATIO = 0.01    # % pixels that must change
+MIN_MOTION_FRAMES = 5       # avoid noise
+NO_MOTION_FRAMES_TO_END = 15
+
+OUTPUT_FILE = "latest_motion.npy"
+
+# ----------------------------------------------
+
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
@@ -33,6 +50,27 @@ pt_model_path = "checkpoints/vitg-384.pt"
 classifier_model_path = "checkpoints/ssv2-vitg-384-64x2x3.pt"
 
 ssv2_classes_path = "ssv2_classes.json"
+
+
+# -------------------------------------------
+
+def detect_motion(prev_gray, curr_gray):
+    diff = cv2.absdiff(prev_gray, curr_gray)
+    _, thresh = cv2.threshold(diff, MOTION_THRESHOLD, 255, cv2.THRESH_BINARY)
+
+    motion_ratio = np.sum(thresh > 0) / thresh.size
+    return motion_ratio > MOTION_AREA_RATIO
+
+
+def play_video(frames, fps=20):
+    delay = int(1000 / fps)
+    for f in frames:
+        cv2.imshow("Captured Motion", f)
+        if cv2.waitKey(delay) & 0xFF == 27:
+            break
+    cv2.destroyWindow("Captured Motion")
+
+# --------------------------------------------
 
 def load_pretrained_vjepa_pt_weights(model, pretrained_weights):
     # Load weights of the VJEPA2 encoder
@@ -66,20 +104,25 @@ def build_pt_video_transform(img_size):
     )
     return eval_transform
 
+# sample 64 frames evenly from the input video, or repeat last frame if not enough frames
+def sample_frames(frames, num_samples=64):
+    T = len(frames)
+    
+    if T < num_samples:
+        # repeat last frame if frames are less than num_samples
+        indices = np.linspace(0, T - 1, num_samples).astype(int)
+    else:
+        indices = np.linspace(0, T - 1, num_samples).astype(int)
+    
+    return frames[indices]
 
-def get_video():
-    vr = VideoReader("sample_video.mp4")
-    # choosing some frames here, you can define more complex sampling strategy
-    frame_idx = np.arange(0, 128, 2)
-    video = vr.get_batch(frame_idx).asnumpy()
-    return video
 
-
-def forward_vjepa_video(model_hf, model_pt, hf_transform, pt_transform):
+def forward_vjepa_video(model_hf, model_pt, hf_transform, pt_transform, clip):
     # Run a sample inference with VJEPA
     with torch.inference_mode():
         # Read and pre-process the image
-        video = get_video()  # T x H x W x C
+        #video = get_video()  # T x H x W x C
+        video = sample_frames(clip, num_samples=64) 
         video = torch.from_numpy(video).permute(0, 3, 1, 2)  # T x C x H x W
         x_pt = pt_transform(video).cuda().unsqueeze(0)
         x_hf = hf_transform(video, return_tensors="pt")["pixel_values_videos"].to("cuda")
@@ -108,27 +151,11 @@ def get_vjepa_video_classification_results(classifier, out_patch_features_pt):
     return
 
 
-def run_sample_inference():
-
-    # Initialize the HuggingFace model, load pretrained weights
-    model_hf = AutoModel.from_pretrained(hf_model_name)
-    model_hf.cuda().eval()
-
-    # Build HuggingFace preprocessing transform
-    hf_transform = AutoVideoProcessor.from_pretrained(hf_model_name)
-    img_size = hf_transform.crop_size["height"]  # E.g. 384, 256, etc.
-
-    # Initialize the PyTorch model, load pretrained weights
-    model_pt = vit_giant_xformers_rope(img_size=(img_size, img_size), num_frames=64)
-    model_pt.cuda().eval()
-    load_pretrained_vjepa_pt_weights(model_pt, pt_model_path)
-
-    # Build PyTorch preprocessing transform
-    pt_video_transform = build_pt_video_transform(img_size=img_size)
+def run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, clip):
 
     # Inference on video
     out_patch_features_hf, out_patch_features_pt = forward_vjepa_video(
-        model_hf, model_pt, hf_transform, pt_video_transform
+        model_hf, model_pt, hf_transform, pt_video_transform, clip
     )
     
     print(
@@ -149,7 +176,108 @@ def run_sample_inference():
 
     get_vjepa_video_classification_results(classifier, out_patch_features_pt)
 
+def main():
+    cap = cv2.VideoCapture(CAM_ID)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, FPS)
+
+    # --------------------------------------------------
+
+    # Initialize the HuggingFace model, load pretrained weights
+    model_hf = AutoModel.from_pretrained(hf_model_name)
+    model_hf.cuda().eval()
+
+    # Build HuggingFace preprocessing transform
+    hf_transform = AutoVideoProcessor.from_pretrained(hf_model_name)
+    img_size = hf_transform.crop_size["height"]  # E.g. 384, 256, etc.
+
+    # Initialize the PyTorch model, load pretrained weights
+    model_pt = vit_giant_xformers_rope(img_size=(img_size, img_size), num_frames=64)
+    model_pt.cuda().eval()
+    load_pretrained_vjepa_pt_weights(model_pt, pt_model_path)
+
+    # Build PyTorch preprocessing transform
+    pt_video_transform = build_pt_video_transform(img_size=img_size)
+
+    # ----------------------------------------------   
+
+    prev_gray = None
+
+    buffer = []
+    motion_buffer = []
+
+    in_motion = False
+    motion_count = 0
+    no_motion_count = 0
+
+    print("Starting capture... Press 'q' to quit")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if prev_gray is None:
+            prev_gray = gray
+            continue
+
+        motion = detect_motion(prev_gray, gray)
+
+        # Always maintain buffer
+        buffer.append(frame)
+        if len(buffer) > FPS * 5:  # keep last 5 seconds
+            buffer.pop(0)
+
+        if motion:
+            motion_count += 1
+            no_motion_count = 0
+        else:
+            no_motion_count += 1
+
+        # START MOTION
+        if not in_motion and motion_count >= MIN_MOTION_FRAMES:
+            print("Motion started")
+            in_motion = True
+            motion_buffer = buffer.copy()  # include context
+
+        # DURING MOTION
+        if in_motion:
+            motion_buffer.append(frame)
+
+        # END MOTION
+        if in_motion and no_motion_count >= NO_MOTION_FRAMES_TO_END:
+            print("Motion ended")
+
+            clip = np.array(motion_buffer, dtype=np.uint8)
+
+#            print(f"Saving clip: shape={clip.shape}")
+#            np.save(OUTPUT_FILE, clip)
+
+            # Play captured clip
+            play_video(clip, FPS)
+
+            run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, clip)
+
+            # Reset
+            in_motion = False
+            motion_buffer = []
+            motion_count = 0
+            no_motion_count = 0
+
+        prev_gray = gray
+
+        # Live preview
+        cv2.imshow("Live Feed", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     # Run with: `python -m notebooks.vjepa2_demo`
-    run_sample_inference()
+    main()
