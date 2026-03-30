@@ -14,6 +14,8 @@ import torch.nn.functional as F
 from decord import VideoReader
 from transformers import AutoModel, AutoVideoProcessor
 
+from datasets import load_dataset
+
 import src.datasets.utils.video.transforms as video_transforms
 import src.datasets.utils.video.volume_transforms as volume_transforms
 from src.models.attentive_pooler import AttentiveClassifier
@@ -30,8 +32,8 @@ FRAME_HEIGHT = 480
 FPS = 60
 
 # Motion detection thresholds
-START_THRESHOLD = 0.3     # start motion
-STOP_THRESHOLD = 0.2      # stop motion
+START_THRESHOLD = 0.7     # start motion
+STOP_THRESHOLD = 0.5      # stop motion
 
 MIN_MOTION_FRAMES = 10     # avoid noise
 NO_MOTION_FRAMES = 10     # confirm motion end
@@ -45,16 +47,12 @@ IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 # HuggingFace model repo name
 hf_model_name = (
-    "facebook/vjepa2-vitg-fpc64-384"  # Replace with your favored model, e.g. facebook/vjepa2-vitg-fpc64-384
+    "facebook/vjepa2-vitl-fpc16-256-ssv2"  # Replace with your favored model, e.g. facebook/vjepa2-vitg-fpc64-384
     )
 
-# Path to local PyTorch weights
-pt_model_path = "checkpoints/vitg-384.pt" # vjepa2_1_vitb_dist_vitG_384.pt" 
-
-classifier_model_path = "checkpoints/ssv2-vitg-384-64x2x3.pt"
+classifier_model_path = "checkpoints/ssv2-vitl-16x2x3.pt" #ssv2-vitg-384-64x2x3.pt
 
 ssv2_classes_path = "ssv2_classes.json"
-
 
 # -------------------------------------------
 
@@ -65,26 +63,6 @@ def compute_flow_magnitude(prev_gray, gray):
     )
     mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
     return np.mean(mag)
-
-"""
-def replay_video(frames, fps=30):
-    delay = int(1000 / fps)
-    for f in frames:
-        cv2.imshow("Captured Motion", f)
-        if cv2.waitKey(delay) & 0xFF == 27:
-            break
-    cv2.destroyWindow("Captured Motion")
-"""
-# --------------------------------------------
-
-def load_pretrained_vjepa_pt_weights(model, pretrained_weights):
-    # Load weights of the VJEPA2 encoder
-    # The PyTorch state_dict is already preprocessed to have the right key names
-    pretrained_dict = torch.load(pretrained_weights, weights_only=True, map_location="cpu")["encoder"]
-    pretrained_dict = {k.replace("module.", ""): v for k, v in pretrained_dict.items()}
-    pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
-    msg = model.load_state_dict(pretrained_dict, strict=False)
-    print("Pretrained weights found at {} and loaded with msg: {}".format(pretrained_weights, msg))
 
 
 def load_pretrained_vjepa_classifier_weights(model, pretrained_weights):
@@ -122,17 +100,15 @@ def sample_frames(frames, num_samples=64):
     return frames[indices]
 
 
-def forward_vjepa_video(model_hf, model_pt, hf_transform, pt_transform, clip):
+def forward_vjepa_video(model_hf, hf_transform, clip):
     # Run a sample inference with VJEPA
     with torch.inference_mode():
         # Read and pre-process the image
-        #video = get_video()  # T x H x W x C
-        video = sample_frames(clip, num_samples=8) 
+        video = sample_frames(clip, num_samples=16)
         video = torch.from_numpy(video).permute(0, 3, 1, 2)  # T x C x H x W
-        #x_pt = pt_transform(video).cuda().unsqueeze(0)
+
         x_hf = hf_transform(video, return_tensors="pt")["pixel_values_videos"].to("cuda")
         # Extract the patch-wise features from the last layer
-        #out_patch_features_pt = model_pt(x_pt)
         out_patch_features_hf = model_hf.get_vision_features(x_hf)
 
     #return out_patch_features_hf, out_patch_features_pt
@@ -157,34 +133,19 @@ def get_vjepa_video_classification_results(classifier, out_patch_features):
     return
 
 
-def run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, classifier, clip):
+def run_sample_inference(model_hf, hf_transform, classifier, clip):
 
     # Inference on video
-    #out_patch_features_hf, out_patch_features_pt = forward_vjepa_video(
-    #    model_hf, model_pt, hf_transform, pt_video_transform, clip
-    #)
-    
     out_patch_features = forward_vjepa_video(
-        model_hf, model_pt, hf_transform, pt_video_transform, clip
+        model_hf, hf_transform, clip
     )
 
-    # print(
-    #     f"""
-    #     Inference results on video:
-    #     HuggingFace output shape: {out_patch_features_hf.shape}
-    #     PyTorch output shape:     {out_patch_features_pt.shape}
-    #     Absolute difference sum:  {torch.abs(out_patch_features_pt - out_patch_features_hf).sum():.6f}
-    #     Close: {torch.allclose(out_patch_features_pt, out_patch_features_hf, atol=1e-3, rtol=1e-3)}
-    #     """
-    # )
+    print("Feature shape:", out_patch_features.shape)
 
     get_vjepa_video_classification_results(classifier, out_patch_features)
 
 
 def main():
-
-
-    # --------------------------------------------------
 
     # Initialize the HuggingFace model, load pretrained weights
     model_hf = AutoModel.from_pretrained(hf_model_name)
@@ -194,20 +155,12 @@ def main():
     hf_transform = AutoVideoProcessor.from_pretrained(hf_model_name)
     img_size = hf_transform.crop_size["height"]  # E.g. 384, 256, etc.
 
-    # Initialize the PyTorch model, load pretrained weights
-    model_pt = vit_giant_xformers_rope(img_size=(img_size, img_size), num_frames=64)
-    model_pt.cuda().eval()
-    load_pretrained_vjepa_pt_weights(model_pt, pt_model_path)
+    embed_dim_hf = model_hf.config.hidden_size
 
-    # for speed, we can compile the PyTorch model
-    #model_pt = torch.compile(model_pt, mode="max-autotune")
-
-    # Build PyTorch preprocessing transform
-    pt_video_transform = build_pt_video_transform(img_size=img_size)
 
     # Initialize the classifier
     classifier = (
-        AttentiveClassifier(embed_dim=model_pt.embed_dim, num_heads=16, depth=4, num_classes=174).cuda().eval()
+        AttentiveClassifier(embed_dim=embed_dim_hf, num_heads=16, depth=4, num_classes=174).cuda().eval()
     )
     load_pretrained_vjepa_classifier_weights(classifier, classifier_model_path)
 
@@ -271,12 +224,9 @@ def main():
                         np.save(SAVE_PATH, video_np)
                         print(f"Saved motion: {video_np.shape}")
 
-                        # Replay captured motion
-                        #replay_video(video_np, fps=FPS)
-
                         start_time = time.perf_counter()
                         # run VJEPA inference on the captured motion
-                        run_sample_inference(model_hf, model_pt, hf_transform, pt_video_transform, classifier, video_np)
+                        run_sample_inference(model_hf, hf_transform, classifier, video_np)
 
                         end_time = time.perf_counter()
                         elapsed_time = end_time - start_time
