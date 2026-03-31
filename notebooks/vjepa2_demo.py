@@ -19,7 +19,7 @@ from datasets import load_dataset
 import src.datasets.utils.video.transforms as video_transforms
 import src.datasets.utils.video.volume_transforms as volume_transforms
 from src.models.attentive_pooler import AttentiveClassifier
-from src.models.vision_transformer import vit_giant_xformers_rope
+#from src.models.vision_transformer import vit_giant_xformers_rope   
 
 
 
@@ -32,11 +32,11 @@ FRAME_HEIGHT = 480
 FPS = 60
 
 # Motion detection thresholds
-START_THRESHOLD = 0.7     # start motion
-STOP_THRESHOLD = 0.5      # stop motion
+START_THRESHOLD = 0.35     # start motion
+STOP_THRESHOLD = 0.35     # stop motion
 
-MIN_MOTION_FRAMES = 10     # avoid noise
-NO_MOTION_FRAMES = 10     # confirm motion end
+MIN_MOTION_FRAMES = 20     # avoid noise
+NO_MOTION_FRAMES = 20     # confirm motion end
 
 SAVE_PATH = "motion.npy"
 
@@ -100,11 +100,34 @@ def sample_frames(frames, num_samples=64):
     return frames[indices]
 
 
+def sample_multiclips(frames, num_clips=6, frames_per_clip=16):
+    T = len(frames)
+    clips = []
+
+    segment_size = T // num_clips
+
+    for i in range(num_clips):
+        start = i * segment_size
+        end = min(start + segment_size, T)
+
+        segment = frames[start:end]
+
+        if len(segment) < frames_per_clip:
+            indices = np.linspace(0, len(segment) - 1, frames_per_clip).astype(int)
+        else:
+            indices = np.linspace(0, len(segment) - 1, frames_per_clip).astype(int)
+
+        clip_i = segment[indices]
+        clips.append(clip_i)
+
+    return np.concatenate(clips, axis=0)  # (6*16, H, W, C)
+
 def forward_vjepa_video(model_hf, hf_transform, clip):
     # Run a sample inference with VJEPA
     with torch.inference_mode():
         # Read and pre-process the image
-        video = sample_frames(clip, num_samples=16)
+        video = sample_frames(clip, num_samples=8)
+        #video = sample_multiclips(clip, num_clips=2, frames_per_clip=8)
         video = torch.from_numpy(video).permute(0, 3, 1, 2)  # T x C x H x W
 
         x_hf = hf_transform(video, return_tensors="pt")["pixel_values_videos"].to("cuda")
@@ -129,7 +152,7 @@ def get_vjepa_video_classification_results(classifier, out_patch_features):
     for idx, prob in zip(top3_indices, top3_probs):
         str_idx = str(idx.item())
         print(f"{SOMETHING_SOMETHING_V2_CLASSES[str_idx]} ({prob}%)")
-    print("------------------------------------------------------------------------------")
+    #print("------------------------------------------------------------------------------")
     return
 
 
@@ -140,7 +163,7 @@ def run_sample_inference(model_hf, hf_transform, classifier, clip):
         model_hf, hf_transform, clip
     )
 
-    print("Feature shape:", out_patch_features.shape)
+    #print("Feature shape:", out_patch_features.shape)
 
     get_vjepa_video_classification_results(classifier, out_patch_features)
 
@@ -180,7 +203,15 @@ def main():
     motion_count = 0
     no_motion_count = 0
 
+    cv2.namedWindow("Live", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Live", 1280, 960)
+
+
     print("Press 'q' to quit")
+
+    print("================================================================================")
+
+    print("\n")
 
     while True:
         ret, frame = cap.read()
@@ -222,7 +253,7 @@ def main():
 
                         # Save (overwrite previous)
                         np.save(SAVE_PATH, video_np)
-                        print(f"Saved motion: {video_np.shape}")
+                        #print(f"Saved motion: {video_np.shape}")
 
                         start_time = time.perf_counter()
                         # run VJEPA inference on the captured motion
@@ -231,6 +262,9 @@ def main():
                         end_time = time.perf_counter()
                         elapsed_time = end_time - start_time
                         print(f"Inferencing took {elapsed_time:.4f} seconds")
+
+                        print('\n')
+                        print("================================================================================")
 
                     # Reset state
                     in_motion = False
